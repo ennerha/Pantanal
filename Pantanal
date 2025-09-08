@@ -1,0 +1,294 @@
+# ============================================================
+# NDVI (Landsat L2 C2) — Pantanal — 1985..2024
+# - Grade fixa: EPSG:3857 @ 300 m (proj300)
+# - NDVI mensal: 30 m -> 300 m (mean) + mediana temporal
+# - Stack anual (12 bandas), Int16 *10000, NoData=-32768
+# - Percentis calculados NO EE na MESMA grade (sem bestEffort)
+# - NoData aplicado SOMENTE no export
+# ============================================================
+
+# (0) Ambiente: instalar deps e montar Drive
+!pip -q install earthengine-api geopandas shapely rasterio numpy
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import ee, datetime, json, sys, os, glob
+import geopandas as gpd
+import shapely.geometry as sgeom
+from shapely.geometry import mapping
+import numpy as np
+import pandas as pd
+import rasterio
+
+# (1) Autenticação EE
+try:
+    ee.Initialize()
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project="ee-cheilabaiao")
+
+print("EE OK às", datetime.datetime.now())
+
+# (2) Parâmetros
+PROJECT        = "ee-cheilabaiao"
+DRIVE_FOLDER   = "Pantanal_TippingPoints"  # <<< ajuste >>> pasta do Drive
+PREFIX         = "NDVI_Pantanal"
+START_YEAR     = 1985
+END_YEAR       = 2024
+
+CRS            = "EPSG:3857"    # projeção métrica
+EXPORT_SCALE   = 300             # 300 m
+NODATA         = -32768          # sentinel seguro para Int16 x10000
+
+proj300 = ee.Projection(CRS).atScale(EXPORT_SCALE)
+
+print(json.dumps({
+    "folder": DRIVE_FOLDER,
+    "prefix": PREFIX,
+    "years": [START_YEAR, END_YEAR],
+    "crs": CRS,
+    "scale_m": EXPORT_SCALE,
+    "nodata": NODATA
+}, indent=2))
+
+# (3) Shapefile -> geometria Pantanal + bbox de export + máscara 300m
+SHP_PATH = '/content/drive/MyDrive/Pantanal/Pantanal.shp'  # <<< ajuste >>>
+
+def force_2d_any(geom):
+    """Força 2D para shapely >=2 e <2, evitando Z/M."""
+    try:
+        from shapely import force_2d  # shapely >= 2.0
+        return force_2d(geom)
+    except Exception:
+        if geom.is_empty: return geom
+        if isinstance(geom, sgeom.Point): return sgeom.Point(geom.x, geom.y)
+        if isinstance(geom, sgeom.LineString): return sgeom.LineString([(x,y) for x,y,*_ in geom.coords])
+        if isinstance(geom, sgeom.LinearRing): return sgeom.LinearRing([(x,y) for x,y,*_ in geom.coords])
+        if isinstance(geom, sgeom.Polygon):
+            ext = [(x,y) for x,y,*_ in geom.exterior.coords]
+            ints = [[(x,y) for x,y,*_ in r.coords] for r in geom.interiors]
+            return sgeom.Polygon(ext, ints)
+        if isinstance(geom, sgeom.MultiPolygon):
+            return sgeom.MultiPolygon([force_2d_any(g) for g in geom.geoms])
+        if isinstance(geom, sgeom.GeometryCollection):
+            return sgeom.GeometryCollection([force_2d_any(g) for g in geom.geoms])
+        return geom
+
+gdf = gpd.read_file(SHP_PATH)
+if gdf.crs is None or gdf.crs.to_epsg() != 4326:
+    gdf = gdf.to_crs(epsg=4326)
+try:
+    gdf = gdf.explode(index_parts=False)
+except TypeError:
+    gdf = gdf.explode()
+
+gdf['geometry'] = gdf['geometry'].apply(force_2d_any).buffer(0)
+gdf = gdf[gdf.is_valid]
+
+features = [ee.Feature(ee.Geometry(mapping(geom), None, False, True)) for geom in gdf.geometry]
+pantanal = ee.FeatureCollection(features).geometry()
+
+# BBox simples de export (barata) na projeção alvo
+roi_export = ee.Geometry(pantanal).transform(CRS, 1).bounds(maxError=100)
+
+# Máscara raster (1 dentro da geometria; fora=mascara)
+mask300 = ee.Image.constant(1).toByte().reproject(proj300).clip(pantanal)
+
+# Área diagnóstica na mesma grade
+area_m2 = (ee.Image.pixelArea().reproject(proj300).updateMask(mask300)
+           .reduceRegion(ee.Reducer.sum(), geometry=roi_export, crs=CRS,
+                         scale=EXPORT_SCALE, bestEffort=True, tileScale=16, maxPixels=1e13)
+           .get('area').getInfo())
+print('Área (km²) ~', area_m2/1e6)
+
+# (4) Funções Landsat L2 -> NDVI
+def scale_sr(img):
+    sr = img.select('SR_B.*').multiply(0.0000275).add(-0.2)
+    return img.addBands(sr, overwrite=True)
+
+def add_red_nir(img, sensor):
+    if sensor == 'L89':   # L8/9
+        red = img.select('SR_B4'); nir = img.select('SR_B5')
+    else:                 # L5/7
+        red = img.select('SR_B3'); nir = img.select('SR_B4')
+    return img.addBands([red.rename('RED'), nir.rename('NIR')])
+
+def add_ndvi(img):
+    return img.addBands(img.normalizedDifference(['NIR','RED']).rename('NDVI'))
+
+# (5) Coleções
+L5 = (ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+      .filterBounds(pantanal).filterDate('1985-01-01', '2013-07-01')
+      .map(scale_sr).map(lambda im: add_red_nir(im,'L57')).map(add_ndvi)
+      .select(['NDVI']))
+
+L7 = (ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+      .filterBounds(pantanal).filterDate('1999-01-01', '2024-12-31')
+      .map(scale_sr).map(lambda im: add_red_nir(im,'L57')).map(add_ndvi)
+      .select(['NDVI']))
+
+L8 = (ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+      .filterBounds(pantanal).filterDate('2013-04-11', '2024-12-31')
+      .map(scale_sr).map(lambda im: add_red_nir(im,'L89')).map(add_ndvi)
+      .select(['NDVI']))
+
+L9 = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+      .filterBounds(pantanal).filterDate('2021-11-01', '2024-12-31')
+      .map(scale_sr).map(lambda im: add_red_nir(im,'L89')).map(add_ndvi)
+      .select(['NDVI']))
+
+LS_NDVI = L5.merge(L7).merge(L8).merge(L9)
+print('Cenas NDVI na coleção total:', LS_NDVI.size().getInfo())
+
+# (6) NDVI mensal (grade 300 m), SEM unmask; NoData será aplicado só no export
+def monthly_ndvi_300m(year: int, month: int) -> ee.Image:
+    ini = ee.Date.fromYMD(year, month, 1); end = ini.advance(1, 'month')
+    coll = LS_NDVI.filterDate(ini, end).filterBounds(roi_export)
+    nscenes = coll.size()
+
+    def _to300(im):
+        return (im.select('NDVI')
+                  .clip(roi_export)
+                  .reduceResolution(ee.Reducer.mean(), maxPixels=65535)
+                  .setDefaultProjection(proj300))
+
+    coll300 = coll.map(_to300)
+
+    nd300 = ee.Image(ee.Algorithms.If(
+        nscenes.gt(0),
+        coll300.median(),
+        ee.Image(0).updateMask(ee.Image(0))   # tudo mascarado se vazio
+    )).reproject(proj300)
+
+    nd300 = nd300.updateMask(mask300)
+
+    im = (nd300.multiply(10000).round().toInt16()
+               # NÃO aplicar unmask aqui!
+               .rename(f'NDVI_{month:02d}')
+               .set({'system:time_start': ini.millis(), 'count': nscenes}))
+    return im
+
+def yearly_stack_300m(year: int) -> ee.Image:
+    # Aplica unmask(NODATA) SOMENTE aqui (no produto final)
+    bands = []
+    for m in range(1, 12+1):
+        im_m = monthly_ndvi_300m(year, m).reproject(proj300)
+        bands.append(im_m.unmask(NODATA))
+    return (ee.Image.cat(bands)
+            .reproject(proj300)
+            .clip(roi_export)
+            .toInt16()
+            .set({'year': year, 'system:time_start': ee.Date.fromYMD(year,1,1).millis()}))
+
+# (7) Percentis mensais na MESMA grade (sem bestEffort)
+def monthly_percentiles_300m(year: int, perc=[5,25,50,75,95]) -> pd.DataFrame:
+    rows=[]
+    for m in range(1,13):
+        im = monthly_ndvi_300m(year, m).reproject(proj300)  # mascarada
+        s = (im.reduceRegion(
+                reducer=ee.Reducer.percentile(perc),
+                geometry=roi_export,          # mesma região do export
+                crs=CRS,                      # EPSG:3857
+                scale=EXPORT_SCALE,           # 300 m
+                bestEffort=False,
+                tileScale=16,
+                maxPixels=1e13)
+             .getInfo() or {})
+        row={'band': f'NDVI_{m:02d}'}
+        for p in perc:
+            key=f'NDVI_{m:02d}_p{p}'
+            val = s.get(key)
+            row[f'p{p}'] = (val/10000.0) if val is not None else None
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+# (8) Export anual (COG GeoTIFF)
+def export_one_year(year: int):
+    img = yearly_stack_300m(year)
+    desc = f'{PREFIX}_{year}_stack_300m'
+    task = ee.batch.Export.image.toDrive(
+        image=img,
+        description=desc,
+        folder=DRIVE_FOLDER,
+        fileNamePrefix=desc,
+        region=roi_export,
+        crs=CRS,
+        scale=EXPORT_SCALE,
+        maxPixels=1e13,
+        fileFormat='GeoTIFF',
+        formatOptions={'cloudOptimized': True, 'noData': NODATA}
+    )
+    task.start()
+    print('> Export iniciado:', desc)
+
+# (9) Diagnóstico de cobertura (cenas/mês)
+def months_check(y):
+    empty=[]; counts=[]
+    for m in range(1,13):
+        c = (LS_NDVI.filterBounds(roi_export)
+                     .filterDate(ee.Date.fromYMD(y,m,1), ee.Date.fromYMD(y,m,1).advance(1,'month'))
+                     .size().getInfo())
+        counts.append(int(c))
+        if c==0: empty.append(m)
+    print(f'{y}: cenas/mês =', counts, '| meses vazios:', empty or 'nenhum')
+
+# =============== EXEMPLO (teste com 2005) ===============
+TEST_YEAR = 2005
+
+print("\n[Pré-export] Percentis (EE):")
+df_pre = monthly_percentiles_300m(TEST_YEAR)
+print(df_pre.round(4).to_string(index=False))
+
+months_check(TEST_YEAR)
+export_one_year(TEST_YEAR)
+
+# (10) Monitor simples das tasks
+print("\n[Tasks EE]:")
+for t in ee.batch.Task.list():
+    st = t.status()
+    print('-', st.get('description'), '|', st.get('state'))
+
+# (11) (Opcional) Comparação pós-export (rode quando o arquivo estiver no Drive)
+def find_exported_tif(year: int):
+    folder = f"/content/drive/MyDrive/{DRIVE_FOLDER}"
+    pat = os.path.join(folder, f"{PREFIX}_{year}_stack_300m*.tif")
+    matches = sorted(glob.glob(pat))
+    return matches[-1] if matches else None
+
+tif_path = find_exported_tif(TEST_YEAR)
+if tif_path and os.path.exists(tif_path):
+    print("\n[Verificação pós-export] Arquivo encontrado:", os.path.basename(tif_path))
+    with rasterio.open(tif_path) as ds:
+        print("Bandas:", ds.count)
+        print("CRS   :", ds.crs)
+        print("Dtype :", ds.dtypes[0])
+        print("NoData:", ds.nodatavals[0])
+        print("Transform:", ds.transform)
+        if ds.crs and ds.crs.is_projected:
+            print(f"Pixel ~ {abs(ds.transform.a):.2f} m × {abs(ds.transform.e):.2f} m")
+
+        scale = 10000.0 if ds.dtypes[0]=='int16' else 1.0
+        stats=[]
+        for b in range(1, ds.count+1):
+            arr = ds.read(b, masked=True).astype('float32')
+            vals = (arr.compressed()/scale) if hasattr(arr, 'mask') else (arr/scale).ravel()
+            if vals.size==0:
+                stats.append({'band': f'NDVI_{b:02d}','p5':None,'p25':None,'p50':None,'p75':None,'p95':None})
+            else:
+                qs = np.percentile(vals, [5,25,50,75,95])  # método default (linear)
+                stats.append({'band': f'NDVI_{b:02d}','p5':float(qs[0]),'p25':float(qs[1]),
+                              'p50':float(qs[2]),'p75':float(qs[3]),'p95':float(qs[4])})
+    df_post = pd.DataFrame(stats)
+    print("\nPercentis (pós):")
+    print(df_post.round(4).to_string(index=False))
+
+    df_cmp = df_post.merge(df_pre, on='band', suffixes=('_post','_pre'))
+    for p in [5,25,50,75,95]:
+        df_cmp[f'd_p{p}'] = (df_cmp[f'p{p}_post'] - df_cmp[f'p{p}_pre']).abs()
+    print("\nDiferenças |pós - pré| (esperado ~0):")
+    print(df_cmp[[ 'band'] + [f'd_p{p}' for p in [5,25,50,75,95]]].round(4).to_string(index=False))
+
+else:
+    print("\n[Verificação pós-export] GeoTIFF de teste ainda não localizado no Drive "
+          f"(padrão: {DRIVE_FOLDER}/{PREFIX}_{TEST_YEAR}_stack_300m*.tif).")
