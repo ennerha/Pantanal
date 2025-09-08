@@ -1,0 +1,454 @@
+# ============================================================
+# PANTANAL — NDVI mensal (Landsat) em 300 m + 1º Break (ruptures)
+# HPC: paralelismo (tiles/anos) + paralelismo local (rupturas por linhas)
+# - Fila controlada de chamadas ao GEE (evita 429/503)
+# - 1 chamada por ano/tile (stack com 12 bandas)
+# - Retry com backoff exponencial para falhas transitórias
+# - Processamento local paralelo (joblib) por blocos de linhas
+# - Escrita opcional de GeoTIFF por tile (ano do 1º break)
+# - Sumários por ano e ano-mês
+# ============================================================
+
+# -------------------- Instalação (Colab) --------------------
+!pip -q install earthengine-api geemap geopandas shapely joblib ruptures rasterio
+
+# -------------------- Imports --------------------
+from google.colab import drive
+drive.mount('/content/drive')
+
+import ee, geemap
+import numpy as np
+import geopandas as gpd
+from shapely.geometry import mapping
+from shapely.ops import unary_union
+import shapely.geometry as sgeom
+import json, datetime, time, sys, math, gc, os
+from pathlib import Path
+from joblib import Parallel, delayed
+import ruptures as rpt
+import rasterio
+from rasterio.transform import from_bounds
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
+
+# -------------------- Parâmetros --------------------
+PROJECT        = "ee-cheilabaiao"          # projeto EE
+DRIVE_FOLDER   = "Pantanal_TippingPoints"  # pasta no Google Drive
+PREFIX         = "Pantanal"                # prefixo de arquivos
+START_YEAR     = 1985
+END_YEAR       = 2024
+EXPORT_SCALE   = 300                       # metros (240–300 recomendado)
+CRS            = "EPSG:3857"               # projeção em METROS (3857/6933)
+NODATA         = -32768                    # sentinel Int16
+TILE_PX        = 64                        # 64 px → ~19.2 km de lado (300 m)
+MAX_TILES      = None                      # None = todos; ou ex: 10 para teste
+YEARS_PER_TASK = 1                         # 1 = ano por tarefa (mantém 12 bandas)
+
+# HPC (ajuste conforme o “humor” da quota do EE)
+MAX_GEE_WORKERS   = 3  # número de downloads (tiles/anos) simultâneos
+MAX_LOCAL_CPUS    = -1 # joblib: -1 usa todos os núcleos disponíveis
+ROW_BLOCK         = 64 # processa rupturas em blocos de 64 linhas (tradeoff RAM/CPU)
+SLEEP_BETWEEN_JOBS = 0.10  # pequena folga entre jobs GEE
+
+# Caminhos
+SHP_PATH = '/content/drive/MyDrive/Pantanal/Pantanal.shp'
+OUT_DIR  = Path('/content/drive/MyDrive') / DRIVE_FOLDER
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# -------------------- Autenticação EE --------------------
+ee.Authenticate()
+ee.Initialize(project=PROJECT)
+
+# -------------------- Utils gerais --------------------
+def _json(obj): 
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+def log(msg): 
+    ts = datetime.datetime.now().strftime('%H:%M:%S')
+    print(f"[{ts}] {msg}", flush=True)
+
+log("EE OK → projeto: " + PROJECT)
+log(_json({
+    "drive_folder": str(OUT_DIR),
+    "prefix": PREFIX,
+    "years": [START_YEAR, END_YEAR],
+    "export_scale_m": EXPORT_SCALE,
+    "crs": CRS,
+    "nodata": NODATA,
+    "tile_px": TILE_PX,
+    "gee_workers": MAX_GEE_WORKERS,
+    "local_cpus": MAX_LOCAL_CPUS
+}))
+
+# -------------------- Geometria de entrada --------------------
+def force_2d_any(geom):
+    try:
+        from shapely import force_2d  # shapely >= 2.0
+        return force_2d(geom)
+    except Exception:
+        if geom.is_empty:
+            return geom
+        if isinstance(geom, sgeom.Point):
+            return sgeom.Point(geom.x, geom.y)
+        if isinstance(geom, sgeom.LineString):
+            return sgeom.LineString([(x, y) for x, y, *_ in geom.coords])
+        if isinstance(geom, sgeom.LinearRing):
+            return sgeom.LinearRing([(x, y) for x, y, *_ in geom.coords])
+        if isinstance(geom, sgeom.Polygon):
+            ext = [(x, y) for x, y, *_ in geom.exterior.coords]
+            ints = [[(x, y) for x, y, *_ in r.coords] for r in geom.interiors]
+            return sgeom.Polygon(ext, ints)
+        if isinstance(geom, sgeom.MultiPolygon):
+            return sgeom.MultiPolygon([force_2d_any(g) for g in geom.geoms])
+        if isinstance(geom, sgeom.GeometryCollection):
+            return sgeom.GeometryCollection([force_2d_any(g) for g in geom.geoms])
+        return geom
+
+gdf = gpd.read_file(SHP_PATH)
+if gdf.crs is None or gdf.crs.to_epsg() != 4326:
+    gdf = gdf.to_crs(epsg=4326)
+try:
+    gdf = gdf.explode(index_parts=False)
+except TypeError:
+    gdf = gdf.explode()
+gdf['geometry'] = gdf['geometry'].apply(force_2d_any).buffer(0)
+gdf = gdf[gdf.is_valid]
+
+# Dissolve no EE (mais robusto)
+features = []
+for geom in gdf.geometry:
+    geojson = mapping(geom)
+    ee_geom = ee.Geometry(geojson, None, False, True)
+    features.append(ee.Feature(ee_geom))
+pantanal = ee.FeatureCollection(features).geometry()
+
+area_km2 = pantanal.area(maxError=1).divide(1e6).getInfo()
+log(f"Geometria no EE pronta. Área ~ {area_km2:,.1f} km²")
+
+# ROI para export/reduce na projeção alvo
+proj300 = ee.Projection(CRS).atScale(EXPORT_SCALE)
+roi_export = ee.Geometry(pantanal).transform(CRS, 1).bounds(maxError=100)
+
+# -------------------- Coleções Landsat (NDVI) --------------------
+def scale_sr(img):
+    sr = img.select('SR_B.*').multiply(0.0000275).add(-0.2)
+    return img.addBands(sr, overwrite=True)
+
+def add_red_nir(img, sensor):
+    if sensor == 'L89':   # L8/9
+        red = img.select('SR_B4'); nir = img.select('SR_B5')
+    else:                 # L5/7
+        red = img.select('SR_B3'); nir = img.select('SR_B4')
+    return img.addBands(red.rename('RED')).addBands(nir.rename('NIR'))
+
+def add_ndvi(img):
+    ndvi = img.normalizedDifference(['NIR', 'RED']).rename('NDVI')
+    return img.addBands(ndvi)
+
+L5 = (ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+      .filterBounds(pantanal).filterDate('1985-01-01', '2013-07-01')
+      .map(scale_sr).map(lambda im: add_red_nir(im, 'L57')).map(add_ndvi)
+      .select(['NDVI']))
+
+L7 = (ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+      .filterBounds(pantanal).filterDate('1999-01-01', '2024-12-31')
+      .map(scale_sr).map(lambda im: add_red_nir(im, 'L57')).map(add_ndvi)
+      .select(['NDVI']))
+
+L8 = (ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+      .filterBounds(pantanal).filterDate('2013-04-11', '2024-12-31')
+      .map(scale_sr).map(lambda im: add_red_nir(im, 'L89')).map(add_ndvi)
+      .select(['NDVI']))
+
+L9 = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+      .filterBounds(pantanal).filterDate('2021-11-01', '2024-12-31')
+      .map(scale_sr).map(lambda im: add_red_nir(im, 'L89')).map(add_ndvi)
+      .select(['NDVI']))
+
+LS_NDVI = L5.merge(L7).merge(L8).merge(L9)
+log(f"Cenas NDVI na coleção mesclada: {LS_NDVI.size().getInfo():,}")
+
+# -------------------- NDVI mensal a 300 m (servidor) --------------------
+def monthly_ndvi_300m_safe(year: int, month: int, region_ee) -> ee.Image:
+    ini = ee.Date.fromYMD(year, month, 1)
+    end = ini.advance(1, 'month')
+    coll = LS_NDVI.filterDate(ini, end).filterBounds(region_ee)
+
+    def _to300(im):
+        return (im.select('NDVI')
+                .clip(region_ee)
+                .reduceResolution(ee.Reducer.mean(), maxPixels=65535)
+                .setDefaultProjection(proj300))
+
+    coll300 = coll.map(_to300)
+    nscenes = coll300.size()
+
+    nd_300 = ee.Image(ee.Algorithms.If(
+        nscenes.gt(0),
+        coll300.median().reproject(proj300),
+        ee.Image(0).updateMask(ee.Image(0))
+    ))
+    im = (nd_300.multiply(10000).round().toInt16()
+          .unmask(NODATA)
+          .rename(f'NDVI_{month:02d}')
+          .set({'system:time_start': ini.millis(), 'count': nscenes}))
+    return im
+
+def monthly_stack_year_image(year: int, region_ee) -> ee.Image:
+    bands = [monthly_ndvi_300m_safe(year, m, region_ee).reproject(proj300)
+             for m in range(1, 13)]
+    return ee.Image.cat(bands).toInt16()
+
+# -------------------- Grid de tiles (EPSG:3857) --------------------
+R = 6378137.0
+def lonlat_to_merc(lon, lat):
+    x = R * np.deg2rad(lon)
+    y = R * np.log(np.tan(np.pi/4 + np.deg2rad(lat)/2))
+    return x, y
+
+coords_deg = ee.Geometry(roi_export).bounds(maxError=1).coordinates().getInfo()[0]
+lons = np.array([p[0] for p in coords_deg], dtype=float)
+lats = np.array([p[1] for p in coords_deg], dtype=float)
+xs_m, ys_m = lonlat_to_merc(lons, lats)
+minx, maxx = xs_m.min(), xs_m.max()
+miny, maxy = ys_m.min(), ys_m.max()
+
+tile_m  = EXPORT_SCALE * TILE_PX
+nx = int(math.ceil((maxx - minx) / tile_m))
+ny = int(math.ceil((maxy - miny) / tile_m))
+
+tiles = []
+for ix in range(nx):
+    for iy in range(ny):
+        x0 = minx + ix * tile_m
+        y0 = miny + iy * tile_m
+        x1 = min(x0 + tile_m, maxx)
+        y1 = min(y0 + tile_m, maxy)
+        rect = ee.Geometry.Rectangle([x0, y0, x1, y1], proj=CRS, geodesic=False)
+        tiles.append(rect)
+
+if MAX_TILES is not None:
+    tiles = tiles[:MAX_TILES]
+
+log(f"Tiles: {len(tiles)} ({nx} × {ny}) — ~{tile_m/1000:.1f} km lado")
+
+# -------------------- Download com retry/backoff --------------------
+def ee_to_numpy_with_retry(im, region, scale, max_tries=6, base_sleep=1.0):
+    for attempt in range(1, max_tries+1):
+        try:
+            arr = geemap.ee_to_numpy(ee_object=im, region=region, scale=scale)
+            return arr[0] if isinstance(arr, tuple) else arr
+        except Exception as e:
+            msg = str(e)
+            if attempt == max_tries:
+                raise
+            sleep = base_sleep * (2 ** (attempt-1)) + np.random.rand()*0.25
+            log(f"[retry {attempt}/{max_tries-1}] {msg} → dormindo {sleep:.1f}s")
+            time.sleep(sleep)
+
+def fetch_tile_year_array(region, year, scale=EXPORT_SCALE):
+    """
+    UMA chamada por ano/tile: 12 bandas NDVI_01..NDVI_12 @ 300 m → (H, W, 12)
+    """
+    im12 = monthly_stack_year_image(year, region)
+    arr = ee_to_numpy_with_retry(im12, region, scale=scale)
+    if arr.ndim == 2:  # se vier sem eixo banda
+        arr = arr[:, :, np.newaxis]
+    arr = arr.astype('float32')
+    mask = (arr == NODATA)
+    arr[~mask] = arr[~mask] / 10000.0
+    arr[mask] = np.nan
+    return arr  # (H, W, 12)
+
+def fetch_tile_all_years(region, y0=START_YEAR, y1=END_YEAR, scale=EXPORT_SCALE):
+    chunks = []
+    for y in range(y0, y1+1):
+        arr_y = fetch_tile_year_array(region, y, scale=scale)
+        if arr_y.shape[2] != 12:
+            log(f"[WARN] Ano {y} com shape estranho: {arr_y.shape}")
+        chunks.append(arr_y)
+        time.sleep(SLEEP_BETWEEN_JOBS)
+    return np.concatenate(chunks, axis=2)  # (H, W, 12*anos)
+
+# -------------------- Rupturas: HPC local --------------------
+def _fill_na_linear_1d(x: np.ndarray):
+    idx = np.arange(x.size)
+    good = np.isfinite(x)
+    if good.sum() < 2:
+        return None
+    return np.interp(idx, idx[good], x[good])
+
+def deseasonalize_cube(cube):
+    """
+    Subtrai a climatologia mensal por pixel (rápido, vetorizado).
+    cube: (H, W, B) com B múltiplo de 12, começando em jan.
+    """
+    H, W, B = cube.shape
+    if B % 12 != 0:
+        raise ValueError("B deve ser múltiplo de 12.")
+    # climatologia por mês: média em eixos (tempo ao longo dos meses do mesmo número)
+    clim = np.zeros((H, W, 12), dtype=np.float32)
+    for m in range(12):
+        clim[:, :, m] = np.nanmean(cube[:, :, m::12], axis=2)
+    # aplica
+    out = cube.copy()
+    for m in range(12):
+        out[:, :, m::12] = out[:, :, m::12] - clim[:, :, [m]]
+    return out
+
+def cp_first_break_series(ts: np.ndarray, model="rbf"):
+    """
+    Primeiro breakpoint via ruptures (Binseg).
+    Retorna índice [0..B-1] ou -1.
+    """
+    x = ts.astype('float32')
+    # interpola NaN
+    x = _fill_na_linear_1d(x)
+    if x is None or np.isfinite(x).sum() < 36:
+        return -1
+    try:
+        bkps = rpt.Binseg(model=model).fit(x).predict(n_bkps=1)
+        bp = bkps[0] - 1 if bkps and bkps[0] < len(x) else -1
+        return int(bp)
+    except Exception:
+        return -1
+
+def run_breaks_parallel(cube, row_block=ROW_BLOCK, n_jobs=MAX_LOCAL_CPUS, model="rbf"):
+    """
+    Aplica cp_first_break pixel-a-pixel paralelizando por blocos de linhas.
+    """
+    H, W, B = cube.shape
+    out = np.full((H, W), -1, dtype=np.int32)
+
+    # 1) Deseasonaliza todo o cubo (vetorizado) — remove ciclo anual
+    cube_ds = deseasonalize_cube(cube)
+
+    # 2) Processa em blocos de linhas para usar joblib
+    for r0 in range(0, H, row_block):
+        r1 = min(H, r0 + row_block)
+        flat = cube_ds[r0:r1].reshape(-1, B)  # ((r1-r0)*W, B)
+
+        # joblib paraleliza por séries (cada pixel)
+        idxs = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(cp_first_break_series)(flat[i], model=model) for i in range(flat.shape[0])
+        )
+        out[r0:r1] = np.array(idxs, dtype=np.int32).reshape(r1 - r0, W)
+    return out
+
+def idx_to_year_month(i, start_year=START_YEAR):
+    y = start_year + (i // 12)
+    m = 1 + (i % 12)
+    return y, m
+
+# -------------------- Pipeline de um tile --------------------
+def process_one_tile(tile_idx, region, years=(START_YEAR, END_YEAR), write_geotiff=True):
+    y0, y1 = years
+    t0 = time.time()
+    cube = fetch_tile_all_years(region, y0, y1)
+    H, W, B = cube.shape
+    log(f"[tile {tile_idx}] cube {H}x{W}x{B} baixado em {time.time()-t0:.1f}s")
+
+    # Rupturas
+    t1 = time.time()
+    bp_idx = run_breaks_parallel(cube)  # (H, W), -1 = sem break
+    log(f"[tile {tile_idx}] ruptures OK em {time.time()-t1:.1f}s")
+
+    # Opcional: gravar GeoTIFF "ano do 1º break"
+    if write_geotiff:
+        bounds = ee.Geometry(region).bounds(1).coordinates().getInfo()[0]
+        xs = [p[0] for p in bounds]; ys = [p[1] for p in bounds]
+        minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+
+        year_map = np.zeros_like(bp_idx, dtype=np.int16)
+        mask_break = bp_idx >= 0
+        if mask_break.any():
+            yy = START_YEAR + (bp_idx // 12)
+            year_map[mask_break] = yy[mask_break].astype(np.int16)
+
+        out_path = OUT_DIR / f"{PREFIX}_break_year_tile{tile_idx:04d}.tif"
+        transform = from_bounds(minx, miny, maxx, maxy, W, H)
+        with rasterio.open(
+            out_path, 'w',
+            driver='GTiff',
+            height=H, width=W, count=1, dtype='int16',
+            crs=CRS, transform=transform,
+            compress='DEFLATE', predictor=2, tiled=True, blockxsize=256, blockysize=256,
+            nodata=0
+        ) as dst:
+            dst.write(year_map, 1)
+        log(f"[tile {tile_idx}] salvo: {out_path}")
+
+    del cube
+    gc.collect()
+    return region, bp_idx
+
+# -------------------- Execução paralela (rede) --------------------
+def run_all_tiles(tiles, years=(START_YEAR, END_YEAR), max_workers=MAX_GEE_WORKERS):
+    futures = []
+    results = []
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for i, region in enumerate(tiles, 1):
+            fut = ex.submit(process_one_tile, i, region, years)
+            futures.append(fut)
+        for fut in as_completed(futures):
+            try:
+                region, bp = fut.result()
+                results.append((region, bp))
+            except Exception as e:
+                log(f"[ERRO tile] {e}")
+    log(f"Todos os tiles concluídos em {(time.time()-t0)/60:.1f} min")
+    return results
+
+# -------------------- Rodar --------------------
+results = run_all_tiles(tiles, years=(START_YEAR, END_YEAR))
+
+# -------------------- Sumários --------------------
+import pandas as pd
+
+def summarize_breaks(results, start_year=START_YEAR):
+    total_pixels = 0
+    total_break  = 0
+    agg_years = {}
+    agg_ym = {}
+
+    for region, bp in results:
+        v = bp.ravel()
+        v = v[v >= 0]
+        total_pixels += bp.size
+        total_break  += v.size
+
+        years  = start_year + (v // 12)
+        months = 1 + (v % 12)
+
+        y, c = np.unique(years, return_counts=True)
+        for yi, ci in zip(y, c):
+            agg_years[int(yi)] = agg_years.get(int(yi), 0) + int(ci)
+
+        ym = years * 100 + months
+        ymi, ci2 = np.unique(ym, return_counts=True)
+        for ymi_i, ci_i in zip(ymi, ci2):
+            agg_ym[int(ymi_i)] = agg_ym.get(int(ymi_i), 0) + int(ci_i)
+
+    df_year = (pd.DataFrame({'year': list(agg_years.keys()), 'count': list(agg_years.values())})
+                 .sort_values('year').reset_index(drop=True))
+    df_year['pct'] = (df_year['count'] / total_break) if total_break else 0.0
+
+    df_ym = (pd.DataFrame({'yyyymm': list(agg_ym.keys()), 'count': list(agg_ym.values())})
+               .sort_values('yyyymm').reset_index(drop=True))
+    df_ym['year']  = df_ym['yyyymm'] // 100
+    df_ym['month'] = df_ym['yyyymm'] % 100
+    df_ym['pct']   = (df_ym['count'] / total_break) if total_break else 0.0
+
+    frac = (total_break / total_pixels * 100) if total_pixels else 0.0
+    log(f"Pixels com 1º break: {total_break:,}/{total_pixels:,} ({frac:.2f}%)")
+    return df_year, df_ym
+
+df_year, df_ym = summarize_breaks(results)
+
+# Salvar CSVs no Drive
+csv_year = OUT_DIR / f"{PREFIX}_breaks_by_year.csv"
+csv_ym   = OUT_DIR / f"{PREFIX}_breaks_by_yearmonth.csv"
+df_year.to_csv(csv_year, index=False)
+df_ym.to_csv(csv_ym, index=False)
+log(f"CSVs salvos: {csv_year.name}, {csv_ym.name}")
